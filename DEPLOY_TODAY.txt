@@ -1,0 +1,17 @@
+V1 DEPLOYMENT CHECKLIST
+=======================
+1. Open GitHub and create a new repository, e.g. ur-bls-teaching-planner.
+2. Upload:
+   - app.py
+   - requirements.txt
+   - data/ folder
+3. Open Streamlit Community Cloud.
+4. Choose "Create app" / "New app".
+5. Select the GitHub repository and branch.
+6. Main file: app.py
+7. Deploy.
+8. Open the generated URL in a private/incognito browser window to confirm it works.
+9. Share that URL with the HoD.
+
+Suggested label for today's demonstration:
+"UR BLS Digital Teaching Planning System - Prototype V1"
