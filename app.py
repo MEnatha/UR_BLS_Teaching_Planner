@@ -23,9 +23,10 @@ def load_data():
     programmes = pd.read_csv(DATA/"programme_registry.csv")
     staff_master = pd.read_csv(DATA/"staff_master.csv")
     staff_aliases = pd.read_csv(DATA/"staff_alias_mapping.csv")
-    return units, weeks, events, programmes, staff_master, staff_aliases
+    workload = pd.read_csv(DATA/"academic_workload_sessions.csv", parse_dates=["teaching_date","timestamp"])
+    return units, weeks, events, programmes, staff_master, staff_aliases, workload
 
-units, weeks, events, programmes, staff_master, staff_aliases = load_data()
+units, weeks, events, programmes, staff_master, staff_aliases, workload = load_data()
 
 # Clean numeric display
 units["study_year"] = pd.to_numeric(units["study_year"], errors="coerce").astype("Int64")
@@ -48,7 +49,7 @@ st.sidebar.title("UR Teaching Planner")
 st.sidebar.caption("Prototype V1 • BLS Department")
 page = st.sidebar.radio(
     "Navigate",
-    ["HoD Dashboard","Academic Calendar","Teaching Plan","Staff Calendar","Workload & Gaps","Unit Assignment"]
+    ["HoD Dashboard","Academic Calendar","Teaching Plan","Staff Calendar","Workload Monitoring & Reports","Workload & Gaps","Unit Assignment"]
 )
 
 st.sidebar.divider()
@@ -173,6 +174,14 @@ if page == "HoD Dashboard":
          .reset_index())
     st.bar_chart(cov.set_index("study_year")[["Modules","Units"]])
 
+
+    st.subheader("Integrated workload planning status")
+    w1,w2,w3,w4 = st.columns(4)
+    w1.metric("Planning records", len(workload))
+    w2.metric("Lecturers represented", workload["lecturer"].nunique())
+    w3.metric("Planned contact hours", f'{workload["planned_contact_hours"].sum():.0f}')
+    w4.metric("Modules represented", workload["module"].nunique())
+
     st.subheader("Planning gaps requiring HoD action")
     gaps = pd.DataFrame([
         ["Unit-level staff allocation","Pending","The source workbook lists module teams, but does not map individual staff to each unit."],
@@ -270,6 +279,140 @@ elif page == "Staff Calendar":
             else:
                 cal=cal.sort_values(["Semester","Week","Module","Unit"])
                 st.dataframe(cal,use_container_width=True,hide_index=True,height=560)
+
+
+elif page == "Workload Monitoring & Reports":
+    st.title("Workload Monitoring & Reports")
+    st.caption("Automated reports generated directly from lecturer planning records")
+
+    wf = workload.copy()
+
+    f1,f2,f3,f4 = st.columns(4)
+    lecturer_opts = ["All"] + sorted([x for x in wf["lecturer"].dropna().unique().tolist() if str(x).strip()])
+    programme_opts = ["All"] + sorted([x for x in wf["programme"].dropna().unique().tolist() if str(x).strip()])
+    semester_opts = ["All"] + sorted([x for x in wf["semester"].dropna().unique().tolist() if str(x).strip()])
+    intake_opts = ["All"] + sorted([x for x in wf["intake"].dropna().unique().tolist() if str(x).strip()])
+
+    selected_lecturer = f1.selectbox("Lecturer", lecturer_opts)
+    selected_programme = f2.selectbox("Programme", programme_opts)
+    selected_semester = f3.selectbox("Semester", semester_opts)
+    selected_intake = f4.selectbox("Intake", intake_opts)
+
+    if selected_lecturer != "All":
+        wf = wf[wf["lecturer"] == selected_lecturer]
+    if selected_programme != "All":
+        wf = wf[wf["programme"] == selected_programme]
+    if selected_semester != "All":
+        wf = wf[wf["semester"] == selected_semester]
+    if selected_intake != "All":
+        wf = wf[wf["intake"] == selected_intake]
+
+    report_type = st.selectbox(
+        "Select report",
+        [
+            "Lecturer workload summary",
+            "Module workload summary",
+            "Weekly teaching schedule",
+            "Upcoming teaching",
+            "Sessions due for verification",
+            "Progress monitoring",
+            "Reminder follow-up"
+        ]
+    )
+
+    k1,k2,k3,k4,k5 = st.columns(5)
+    k1.metric("Sessions", len(wf))
+    k2.metric("Planned hours", f'{wf["planned_contact_hours"].sum():.0f}')
+    k3.metric("Lecturers", wf["lecturer"].nunique())
+    k4.metric("Modules", wf["module"].nunique())
+    k5.metric("Upcoming", int((wf["plan_timing"]=="Upcoming").sum()))
+
+    if report_type == "Lecturer workload summary":
+        report = (
+            wf.groupby(["lecturer","email","rank"], dropna=False)
+              .agg(
+                  planned_sessions=("record_id","count"),
+                  planned_contact_hours=("planned_contact_hours","sum"),
+                  modules=("module","nunique"),
+                  due_for_verification=("plan_timing", lambda s: (s=="Planned date passed").sum()),
+                  upcoming_sessions=("plan_timing", lambda s: (s=="Upcoming").sum()),
+              )
+              .reset_index()
+              .sort_values(["planned_contact_hours","planned_sessions"], ascending=False)
+        )
+        st.dataframe(report, use_container_width=True, hide_index=True)
+
+    elif report_type == "Module workload summary":
+        report = (
+            wf.groupby(["module","programme","study_year","semester"], dropna=False)
+              .agg(
+                  planned_sessions=("record_id","count"),
+                  planned_contact_hours=("planned_contact_hours","sum"),
+                  lecturers=("lecturer","nunique"),
+                  activities=("activity","nunique")
+              )
+              .reset_index()
+              .sort_values(["planned_contact_hours","planned_sessions"], ascending=False)
+        )
+        st.dataframe(report, use_container_width=True, hide_index=True)
+
+    elif report_type == "Weekly teaching schedule":
+        report = wf[
+            ["academic_week","teaching_date","start_time","end_time","lecturer",
+             "module","unit","activity","planned_contact_hours","teaching_location"]
+        ].sort_values(["teaching_date","start_time","lecturer"])
+        st.dataframe(report, use_container_width=True, hide_index=True, height=560)
+
+    elif report_type == "Upcoming teaching":
+        report = wf[wf["plan_timing"]=="Upcoming"][
+            ["teaching_date","start_time","end_time","lecturer","email","module","unit",
+             "activity","planned_contact_hours","teaching_location"]
+        ].sort_values(["teaching_date","start_time"])
+        st.dataframe(report, use_container_width=True, hide_index=True, height=560)
+
+    elif report_type == "Sessions due for verification":
+        report = wf[wf["plan_timing"]=="Planned date passed"][
+            ["teaching_date","lecturer","email","module","unit","activity",
+             "planned_contact_hours","delivery_status","remarks"]
+        ].sort_values(["teaching_date","lecturer"])
+        st.warning("A past planned date is not automatically treated as completed. These sessions require verification.")
+        st.dataframe(report, use_container_width=True, hide_index=True, height=560)
+
+    elif report_type == "Progress monitoring":
+        work = wf.copy()
+        work["actual_hours_numeric"] = pd.to_numeric(work["actual_hours_delivered"], errors="coerce").fillna(0)
+        report = (
+            work.groupby(["lecturer","email"], dropna=False)
+                .agg(
+                    planned_hours=("planned_contact_hours","sum"),
+                    actual_hours=("actual_hours_numeric","sum"),
+                    planned_sessions=("record_id","count"),
+                    completed_sessions=("delivery_status", lambda s: (s=="Completed").sum()),
+                    ongoing_sessions=("delivery_status", lambda s: (s=="Ongoing").sum()),
+                    not_verified=("delivery_status", lambda s: (s=="Not verified").sum()),
+                )
+                .reset_index()
+        )
+        report["progress_percent"] = (
+            report["actual_hours"] / report["planned_hours"].replace(0, pd.NA) * 100
+        ).fillna(0).round(1)
+        report = report.sort_values(["progress_percent","planned_hours"], ascending=[True,False])
+        st.dataframe(report, use_container_width=True, hide_index=True)
+        st.caption("Progress is calculated only from confirmed actual hours. Current imported records remain Not verified until delivery is confirmed.")
+
+    elif report_type == "Reminder follow-up":
+        report = wf[
+            ["lecturer","email","teaching_date","module","unit","delivery_status",
+             "reminder_needed","reminder_status","last_reminder_date","remarks"]
+        ].sort_values(["reminder_needed","teaching_date"], ascending=[False,True])
+        st.dataframe(report, use_container_width=True, hide_index=True, height=560)
+
+    st.download_button(
+        "Download filtered planning records (CSV)",
+        wf.to_csv(index=False).encode("utf-8-sig"),
+        file_name="BLS_filtered_workload_report.csv",
+        mime="text/csv"
+    )
 
 elif page == "Workload & Gaps":
     st.title("Workload & Planning Gaps")
