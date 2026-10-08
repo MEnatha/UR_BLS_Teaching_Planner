@@ -24,9 +24,10 @@ def load_data():
     staff_master = pd.read_csv(DATA/"staff_master.csv")
     staff_aliases = pd.read_csv(DATA/"staff_alias_mapping.csv")
     workload = pd.read_csv(DATA/"academic_workload_sessions.csv", parse_dates=["teaching_date","timestamp"])
-    return units, weeks, events, programmes, staff_master, staff_aliases, workload
+    staff_plan = pd.read_csv(DATA/"staff_planned_teaching.csv", parse_dates=["teaching_date"])
+    return units, weeks, events, programmes, staff_master, staff_aliases, workload, staff_plan
 
-units, weeks, events, programmes, staff_master, staff_aliases, workload = load_data()
+units, weeks, events, programmes, staff_master, staff_aliases, workload, staff_plan = load_data()
 
 # Clean numeric display
 units["study_year"] = pd.to_numeric(units["study_year"], errors="coerce").astype("Int64")
@@ -46,10 +47,10 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.sidebar.title("UR Teaching Planner")
-st.sidebar.caption("Prototype V1 • BLS Department")
+st.sidebar.caption("Prototype V1.3 • BLS Department")
 page = st.sidebar.radio(
     "Navigate",
-    ["HoD Dashboard","Academic Calendar","Teaching Plan","Staff Calendar","Workload Monitoring & Reports","Workload & Gaps","Unit Assignment"]
+    ["HoD Dashboard","Staff Teaching Dashboard","Academic Calendar","Teaching Plan","Staff Calendar","Workload Monitoring & Reports","Workload & Gaps","Unit Assignment"]
 )
 
 st.sidebar.divider()
@@ -190,6 +191,110 @@ if page == "HoD Dashboard":
         ["MSc Medical Microbiology teaching plan","Pending source","Programme structure exists; module/unit data not yet provided."],
     ], columns=["Item","Status","Why it matters"])
     st.dataframe(gaps,use_container_width=True,hide_index=True)
+
+
+elif page == "Staff Teaching Dashboard":
+    st.title("Staff Teaching Dashboard")
+    st.caption(
+        "HoD view of each lecturer's planned modules, units/topics and scheduled teaching dates."
+    )
+
+    staff_options = sorted(
+        [x for x in staff_plan["lecturer"].dropna().astype(str).unique().tolist() if x.strip()]
+    )
+    selected_staff = st.selectbox("Select lecturer", staff_options)
+
+    sf = staff_plan[staff_plan["lecturer"] == selected_staff].copy()
+    sf = sf.sort_values(["teaching_date","start_time","module","unit"])
+
+    if sf.empty:
+        st.info("No submitted teaching-plan records are currently available for this lecturer.")
+    else:
+        staff_email = sf["email"].dropna().astype(str)
+        staff_rank = sf["rank"].dropna().astype(str)
+        email_text = staff_email.iloc[0] if len(staff_email) else ""
+        rank_text = staff_rank.iloc[0] if len(staff_rank) else ""
+
+        st.markdown(f"### {selected_staff}")
+        st.caption(f"{rank_text} • {email_text}")
+
+        k1,k2,k3,k4,k5 = st.columns(5)
+        k1.metric("Planned sessions", len(sf))
+        k2.metric("Planned contact hours", f'{sf["planned_contact_hours"].sum():.0f}')
+        k3.metric("Modules", sf["module"].nunique())
+        k4.metric("Units / topics", sf["unit"].nunique())
+        dated = sf["teaching_date"].dropna()
+        k5.metric(
+            "Teaching period",
+            f"{dated.min():%d %b} – {dated.max():%d %b %Y}" if not dated.empty else "Dates pending"
+        )
+
+        st.subheader("Modules and Units / Teaching Topics")
+        module_units = (
+            sf.groupby(["module","unit","programme","study_year","semester","intake"], dropna=False)
+              .agg(
+                  planned_sessions=("record_id","count"),
+                  planned_hours=("planned_contact_hours","sum"),
+                  first_date=("teaching_date","min"),
+                  last_date=("teaching_date","max")
+              )
+              .reset_index()
+              .sort_values(["first_date","module","unit"])
+        )
+        st.dataframe(
+            module_units,
+            use_container_width=True,
+            hide_index=True,
+            height=360
+        )
+
+        st.subheader("Planned Teaching Schedule")
+        schedule = sf[
+            [
+                "teaching_date","academic_week","start_time","end_time",
+                "programme","study_year","intake","semester","module","unit",
+                "activity","planned_contact_hours","teaching_location",
+                "exact_location","laboratory"
+            ]
+        ].copy()
+        st.dataframe(
+            schedule,
+            use_container_width=True,
+            hide_index=True,
+            height=520
+        )
+
+        st.subheader("Schedule by Month")
+        dated_schedule = sf[sf["teaching_date"].notna()].copy()
+        if dated_schedule.empty:
+            st.info("No exact teaching dates have been supplied for this lecturer.")
+        else:
+            dated_schedule["Month"] = dated_schedule["teaching_date"].dt.strftime("%B %Y")
+            monthly = (
+                dated_schedule.groupby("Month", sort=False)
+                .agg(
+                    sessions=("record_id","count"),
+                    planned_hours=("planned_contact_hours","sum"),
+                    modules=("module","nunique")
+                )
+                .reset_index()
+            )
+            st.dataframe(monthly, use_container_width=True, hide_index=True)
+
+        st.download_button(
+            f"Download {selected_staff}'s teaching plan (CSV)",
+            sf.to_csv(index=False).encode("utf-8-sig"),
+            file_name=(
+                selected_staff.replace(" ","_").replace("/","_")
+                + "_Teaching_Plan_2026_2027.csv"
+            ),
+            mime="text/csv"
+        )
+
+    st.info(
+        "This dashboard reflects staff planning records submitted so far. "
+        "Lecturers without submitted records will not yet appear in this selector."
+    )
 
 elif page == "Academic Calendar":
     st.title("Academic Calendar & Teaching Weeks")
@@ -464,4 +569,4 @@ elif page == "Unit Assignment":
     )
 
 st.divider()
-st.caption("UR BLS Digital Teaching Planning System • Prototype V1 • Built for departmental planning review")
+st.caption("UR BLS Digital Teaching Planning System • Prototype V1.3 • Built for departmental planning review")
