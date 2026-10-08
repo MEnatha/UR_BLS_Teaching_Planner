@@ -1,6 +1,9 @@
 
 import streamlit as st
 import pandas as pd
+from difflib import SequenceMatcher
+import re
+import unicodedata
 from pathlib import Path
 import re
 from datetime import datetime
@@ -47,7 +50,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.sidebar.title("UR Teaching Planner")
-st.sidebar.caption("Prototype V1.3 • BLS Department")
+st.sidebar.caption("Prototype V1.4.1 • BLS Department")
 page = st.sidebar.radio(
     "Navigate",
     ["HoD Dashboard","Staff Teaching Dashboard","Academic Calendar","Teaching Plan","Staff Calendar","Workload Monitoring & Reports","Workload & Gaps","Unit Assignment"]
@@ -176,6 +179,194 @@ if page == "HoD Dashboard":
     st.bar_chart(cov.set_index("study_year")[["Modules","Units"]])
 
 
+
+    st.subheader("Staff Planning Submission Coverage")
+
+    def _normalize_staff_name(value):
+        value = "" if pd.isna(value) else str(value)
+        value = unicodedata.normalize("NFKD", value)
+        value = "".join(ch for ch in value if not unicodedata.combining(ch))
+        value = re.sub(r"[^A-Za-z0-9]+", " ", value).lower().strip()
+        value = re.sub(r"\b(prof|professor|dr|assoc|ass|praf|mr|mrs|ms)\b", " ", value)
+        return re.sub(r"\s+", " ", value).strip()
+
+    # Prepare Staff Master and alias lookup.
+    master_match = staff_master.copy()
+    master_match["verified_display_name"] = (
+        master_match["verified_name"]
+        .fillna(master_match["canonical_name"])
+        .astype(str)
+        .str.strip()
+    )
+    master_match["verified_norm"] = master_match["verified_display_name"].map(_normalize_staff_name)
+    master_match["canonical_norm"] = (
+        master_match["canonical_name"].fillna("").map(_normalize_staff_name)
+    )
+    master_match["email_norm"] = (
+        master_match["email"].fillna("").astype(str).str.strip().str.lower()
+    )
+
+    alias_match = staff_aliases.copy()
+    alias_match["alias_norm"] = (
+        alias_match["source_canonical_name"].fillna("").map(_normalize_staff_name)
+    )
+    alias_match["verified_norm"] = (
+        alias_match["verified_name"].fillna("").map(_normalize_staff_name)
+    )
+
+    submitted_unique = (
+        staff_plan[["lecturer", "email"]]
+        .drop_duplicates()
+        .copy()
+    )
+    submitted_unique["lecturer_norm"] = submitted_unique["lecturer"].map(_normalize_staff_name)
+    submitted_unique["email_norm"] = (
+        submitted_unique["email"].fillna("").astype(str).str.strip().str.lower()
+    )
+
+    def _resolve_submitted_staff(row):
+        name = row["lecturer_norm"]
+        email = row["email_norm"]
+
+        # 1) Exact email match where Staff Master has an email.
+        if email:
+            email_hits = master_match[
+                (master_match["email_norm"] != "") &
+                (master_match["email_norm"] == email)
+            ]
+            if len(email_hits) == 1:
+                hit = email_hits.iloc[0]
+                return pd.Series([hit["staff_id"], hit["verified_display_name"], "Email"])
+
+        # 2) Exact Staff Master name match.
+        exact_hits = master_match[
+            (master_match["verified_norm"] == name) |
+            (master_match["canonical_norm"] == name)
+        ]
+        if len(exact_hits) == 1:
+            hit = exact_hits.iloc[0]
+            return pd.Series([hit["staff_id"], hit["verified_display_name"], "Exact name"])
+
+        # 3) Alias map, but only accept plausible aliases.
+        alias_hits = alias_match[alias_match["alias_norm"] == name]
+        if len(alias_hits) == 1:
+            ah = alias_hits.iloc[0]
+            overlap = set(name.split()) & set(ah["verified_norm"].split())
+            similarity = SequenceMatcher(None, name, ah["verified_norm"]).ratio()
+            if overlap or similarity >= 0.82:
+                return pd.Series([ah["staff_id"], ah["verified_name"], "Alias"])
+
+        # 4) Unique token-subset match.
+        name_tokens = set(name.split())
+        partial_hits = []
+        for _, mr in master_match.iterrows():
+            candidate_names = [mr["verified_norm"], mr["canonical_norm"]]
+            matched = False
+            for candidate in candidate_names:
+                candidate_tokens = set(candidate.split())
+                if candidate_tokens and candidate_tokens.issubset(name_tokens):
+                    matched = True
+                    break
+            if matched:
+                partial_hits.append(mr)
+
+        if partial_hits:
+            partial_df = pd.DataFrame(partial_hits).drop_duplicates("staff_id")
+            if len(partial_df) == 1:
+                hit = partial_df.iloc[0]
+                return pd.Series([hit["staff_id"], hit["verified_display_name"], "Unique partial name"])
+
+        # 5) Conservative fuzzy match.
+        best_score = 0
+        best_row = None
+        for _, mr in master_match.iterrows():
+            for candidate in [mr["verified_norm"], mr["canonical_norm"]]:
+                if not candidate:
+                    continue
+                score = SequenceMatcher(None, name, candidate).ratio()
+                if score > best_score:
+                    best_score = score
+                    best_row = mr
+        if best_row is not None and best_score >= 0.88:
+            return pd.Series([
+                best_row["staff_id"],
+                best_row["verified_display_name"],
+                f"Fuzzy ({best_score:.2f})"
+            ])
+
+        return pd.Series([pd.NA, pd.NA, "Needs reconciliation"])
+
+    submitted_unique[
+        ["matched_staff_id", "matched_staff_name", "match_method"]
+    ] = submitted_unique.apply(_resolve_submitted_staff, axis=1)
+
+    matched_staff_ids = set(
+        submitted_unique["matched_staff_id"].dropna().astype(str).tolist()
+    )
+
+    verified_count = int(len(master_match))
+    submitted_count = int(len(matched_staff_ids))
+    pending_count = int(verified_count - submitted_count)
+    coverage_pct = round(
+        (submitted_count / verified_count) * 100, 1
+    ) if verified_count else 0.0
+
+    sc1, sc2, sc3, sc4 = st.columns(4)
+    sc1.metric("Verified staff", verified_count)
+    sc2.metric("Matched submitted plans", submitted_count)
+    sc3.metric("Pending plans", pending_count)
+    sc4.metric("Submission coverage", f"{coverage_pct}%")
+
+    pending_staff = (
+        master_match.loc[
+            ~master_match["staff_id"].astype(str).isin(matched_staff_ids),
+            ["staff_id", "verified_display_name", "title", "email", "department/unit"]
+        ]
+        .rename(columns={"verified_display_name": "Staff name"})
+        .sort_values("Staff name")
+    )
+
+    unresolved_submissions = (
+        submitted_unique[
+            submitted_unique["matched_staff_id"].isna()
+        ][["lecturer", "email", "match_method"]]
+        .rename(columns={
+            "lecturer": "Submitted staff name",
+            "email": "Submitted email",
+            "match_method": "Status"
+        })
+        .drop_duplicates()
+    )
+
+    if pending_count > 0:
+        with st.expander(f"View {pending_count} verified staff with no matched submitted plan", expanded=False):
+            st.dataframe(
+                pending_staff,
+                use_container_width=True,
+                hide_index=True
+            )
+            st.download_button(
+                "Download pending staff list (CSV)",
+                pending_staff.to_csv(index=False).encode("utf-8-sig"),
+                file_name="BLS_Staff_Pending_Teaching_Plans_2026_2027.csv",
+                mime="text/csv"
+            )
+
+    if not unresolved_submissions.empty:
+        with st.expander(
+            f"Needs staff-master reconciliation ({len(unresolved_submissions)})",
+            expanded=False
+        ):
+            st.dataframe(
+                unresolved_submissions,
+                use_container_width=True,
+                hide_index=True
+            )
+            st.caption(
+                "These submitted names are retained as valid planning submissions, "
+                "but they are not counted as matched verified staff until the Staff Master is reconciled."
+            )
+
     st.subheader("Integrated workload planning status")
     w1,w2,w3,w4 = st.columns(4)
     w1.metric("Planning records", len(workload))
@@ -227,6 +418,69 @@ elif page == "Staff Teaching Dashboard":
         k5.metric(
             "Teaching period",
             f"{dated.min():%d %b} – {dated.max():%d %b %Y}" if not dated.empty else "Dates pending"
+        )
+
+
+        st.subheader("Chronological Teaching Schedule")
+
+        schedule_top = sf.copy()
+        schedule_top["Time"] = (
+            schedule_top["start_time"].fillna("").astype(str).str.strip()
+            + " – "
+            + schedule_top["end_time"].fillna("").astype(str).str.strip()
+        ).str.strip(" –")
+
+        schedule_top["Location"] = (
+            schedule_top["exact_location"]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+        )
+        schedule_top.loc[
+            schedule_top["Location"] == "",
+            "Location"
+        ] = schedule_top.loc[
+            schedule_top["Location"] == "",
+            "teaching_location"
+        ].fillna("").astype(str).str.strip()
+
+        chronological = schedule_top[
+            [
+                "teaching_date",
+                "Time",
+                "module",
+                "unit",
+                "activity",
+                "planned_contact_hours",
+                "Location"
+            ]
+        ].copy()
+
+        chronological.columns = [
+            "Date",
+            "Time",
+            "Module",
+            "Unit / Topic",
+            "Activity",
+            "Hours",
+            "Location"
+        ]
+
+        chronological["Date"] = pd.to_datetime(
+            chronological["Date"],
+            errors="coerce"
+        ).dt.strftime("%d %b %Y")
+
+        chronological = chronological.sort_values(
+            ["Date", "Time", "Module", "Unit / Topic"],
+            na_position="last"
+        )
+
+        st.dataframe(
+            chronological,
+            use_container_width=True,
+            hide_index=True,
+            height=430
         )
 
         st.subheader("Modules and Units / Teaching Topics")
@@ -292,8 +546,8 @@ elif page == "Staff Teaching Dashboard":
         )
 
     st.info(
-        "This dashboard reflects staff planning records submitted so far. "
-        "Lecturers without submitted records will not yet appear in this selector."
+        f"This dashboard currently includes {staff_plan['lecturer'].nunique()} staff with submitted planning records. "
+        "The HoD Dashboard shows overall submission coverage against the verified Staff Master."
     )
 
 elif page == "Academic Calendar":
@@ -569,4 +823,4 @@ elif page == "Unit Assignment":
     )
 
 st.divider()
-st.caption("UR BLS Digital Teaching Planning System • Prototype V1.3 • Built for departmental planning review")
+st.caption("UR BLS Digital Teaching Planning System • Prototype V1.4.1 • Built for departmental planning review")
